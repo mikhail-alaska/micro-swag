@@ -1,0 +1,279 @@
+services:
+  frontend:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./frontend/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+    environment:
+      PROXY_TOKEN: ${PROXY_TOKEN:?Fill .env}
+      NGINX_ENVSUBST_FILTER: ^PROXY_TOKEN$$
+    depends_on:
+      backend:
+        condition: service_started
+    networks:
+      web:
+        ipv4_address: 172.30.10.10
+
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "127.0.0.1:8001:8000"
+    volumes:
+      - ./backend:/app
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-swag}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Fill .env}
+      RABBITMQ_USER: ${RABBITMQ_USER:-swag}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Fill .env}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Fill .env}
+      PROXY_TOKEN: ${PROXY_TOKEN:?Fill .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres_standby:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      web:
+        ipv4_address: 172.30.10.20
+      api:
+        ipv4_address: 172.30.20.10
+      db:
+        ipv4_address: 172.30.40.10
+      queue:
+        ipv4_address: 172.30.50.10
+
+  worker:
+    build:
+      context: ./backend
+    command: ["python", "-u", "worker.py"]
+    volumes:
+      - ./backend:/app
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-swag}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Fill .env}
+      RABBITMQ_USER: ${RABBITMQ_USER:-swag}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:?Fill .env}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?Fill .env}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres_standby:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      db:
+        ipv4_address: 172.30.40.20
+      queue:
+        ipv4_address: 172.30.50.20
+  cve_service:
+    build:
+      context: ./cve_service
+    ports:
+      - "127.0.0.1:8002:8000"
+    volumes:
+      - ./cve_service:/app
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      api:
+        ipv4_address: 172.30.20.20
+      cache:
+        ipv4_address: 172.30.30.10
+  redis:
+    image: redis:8-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      cache:
+        ipv4_address: 172.30.30.20
+
+  postgres:
+    image: postgres:17-alpine
+    entrypoint: ["sh", "/opt/swag/start.sh"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-swag}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Fill .env}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Fill .env}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Fill .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./ops/postgres/start.sh:/opt/swag/start.sh:ro
+      - ./ops/postgres/init.sh:/docker-entrypoint-initdb.d/001-init.sh:ro
+      - ./backend/db/init.sql:/opt/swag/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      db:
+        ipv4_address: 172.30.40.30
+
+  postgres_standby:
+    image: postgres:17-alpine
+    entrypoint: ["sh", "/opt/swag/start.sh"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-swag}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Fill .env}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:?Fill .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      UPSTREAM: postgres
+    volumes:
+      - postgres_standby_data:/var/lib/postgresql/data
+      - ./ops/postgres/start.sh:/opt/swag/start.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      db:
+        ipv4_address: 172.30.40.40
+
+  rabbit1:
+    image: rabbitmq:4-management-alpine
+    hostname: rabbit1
+    environment:
+      RABBITMQ_NODENAME: rabbit@rabbit1
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE:?Fill .env}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-swag}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Fill .env}
+    volumes:
+      - rabbit1_data:/var/lib/rabbitmq
+      - ./ops/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    networks:
+      queue:
+        ipv4_address: 172.30.50.41
+
+  rabbit2:
+    image: rabbitmq:4-management-alpine
+    hostname: rabbit2
+    environment:
+      RABBITMQ_NODENAME: rabbit@rabbit2
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE:?Fill .env}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-swag}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Fill .env}
+    volumes:
+      - rabbit2_data:/var/lib/rabbitmq
+      - ./ops/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    depends_on:
+      rabbit1:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    networks:
+      queue:
+        ipv4_address: 172.30.50.42
+
+  rabbit3:
+    image: rabbitmq:4-management-alpine
+    hostname: rabbit3
+    environment:
+      RABBITMQ_NODENAME: rabbit@rabbit3
+      RABBITMQ_ERLANG_COOKIE: ${RABBITMQ_ERLANG_COOKIE:?Fill .env}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-swag}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Fill .env}
+    volumes:
+      - rabbit3_data:/var/lib/rabbitmq
+      - ./ops/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    depends_on:
+      rabbit2:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    networks:
+      queue:
+        ipv4_address: 172.30.50.43
+
+  rabbitmq:
+    image: haproxy:3.0-alpine
+    ports:
+      - "127.0.0.1:15672:15672"
+      - "127.0.0.1:15673:15673"
+      - "127.0.0.1:15674:15674"
+    volumes:
+      - ./ops/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      rabbit1:
+        condition: service_healthy
+      rabbit2:
+        condition: service_healthy
+      rabbit3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      web:
+        ipv4_address: 172.30.10.30
+      queue:
+        ipv4_address: 172.30.50.30
+        aliases: [amqp]
+
+networks:
+  web:
+    ipam:
+      config:
+        - subnet: 172.30.10.0/24
+  api:
+    ipam:
+      config:
+        - subnet: 172.30.20.0/24
+  cache:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.30.0/24
+  db:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.40.0/24
+  queue:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24
+
+volumes:
+  redis_data:
+  postgres_data:
+  postgres_standby_data:
+  rabbit1_data:
+  rabbit2_data:
+  rabbit3_data:
